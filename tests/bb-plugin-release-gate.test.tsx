@@ -197,6 +197,16 @@ describe("bb-plugin-release-gate policy", () => {
 });
 
 describe("bb-plugin-release-gate graph", () => {
+  test("Gateway UI discovery can render the workflow before inputs are populated", async () => {
+    const graph = await renderWorkflow(workflow, {
+      input: {} as never,
+      outputs: {},
+      baseRootDir: resolve(here, ".."),
+      workflowPath: resolve(here, "../pack/workflows/bb-plugin-release-gate.tsx"),
+    });
+    expect(taskMap(graph).has("load-policy")).toBe(true);
+  });
+
   test("verify mode contains deterministic gates and structurally omits all live, approval, and release nodes", async () => {
     const graph = await render("npm-backend-only", "verify", stageOutputs("npm-backend-only"));
     const tasks = taskMap(graph);

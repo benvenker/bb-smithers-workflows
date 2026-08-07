@@ -17,8 +17,7 @@ Inputs:
 Run the installed workflow:
 
 ```bash
-cd .smithers
-bun x smithers workflow run bb-smithers-workflows:bb-plugin-release-gate \
+./.smithers/node_modules/.bin/smithers workflow run bb-smithers-workflows:bb-plugin-release-gate \
   --input '{"pluginRoot":"/absolute/path/to/plugin","mode":"verify"}'
 ```
 
@@ -26,4 +25,4 @@ Release mode first completes deterministic verification and configured live chec
 
 Treat `waived` as non-blocking but distinct from `pass`. A missing official SDK harness for an applicable backend or frontend surface blocks unless an exact current policy waiver covers `harness:backend` or `harness:frontend`. Each configured harness must list a repository-relative source importing the matching official BB testing module.
 
-Use the Gateway for durable operation: `smithers ps`, `smithers inspect RUN_ID`, and `smithers resume RUN_ID`. The installed workflow UI exposes the verdict, evidence, approval, run tree, and event stream.
+Run Smithers from the consumer root so workflow discovery, run storage, and the Gateway share one workspace. Use `./.smithers/node_modules/.bin/smithers ps`, `inspect RUN_ID`, and `resume RUN_ID`. The installed workflow UI exposes the verdict, evidence, approval, run tree, and event stream.

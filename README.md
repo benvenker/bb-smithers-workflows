@@ -8,22 +8,19 @@ Develop against a local checkout:
 
 ```bash
 cd /path/to/bb-plugin
-cd .smithers
-bun x smithers add file:/path/to/bb-smithers-workflows/pack --yes
+./.smithers/node_modules/.bin/smithers add file:/path/to/bb-smithers-workflows/pack --yes
 ```
 
 Pin a published immutable GitHub revision:
 
 ```bash
-cd .smithers
-bun x smithers add github:benvenker/bb-smithers-workflows/pack#COMMIT_SHA --yes
+./.smithers/node_modules/.bin/smithers add github:benvenker/bb-smithers-workflows/pack#COMMIT_SHA --yes
 ```
 
 Smithers installs the pack under `.smithers/packs/bb-smithers-workflows/` and records its source, resolved revision, version, and integrity in `.smithers/packs.lock.toon`. Update the recorded source with:
 
 ```bash
-cd .smithers
-bun x smithers packs update bb-smithers-workflows
+./.smithers/node_modules/.bin/smithers packs update bb-smithers-workflows
 ```
 
 ## Configure
@@ -59,14 +56,13 @@ Mutating `liveChecks` must declare a rollback; `verifyRollback` is optional. `re
 
 ```bash
 cd /path/to/bb-plugin
-cd .smithers
-bun x smithers workflow run bb-smithers-workflows:bb-plugin-release-gate \
+./.smithers/node_modules/.bin/smithers workflow run bb-smithers-workflows:bb-plugin-release-gate \
   --input '{"pluginRoot":"/absolute/path/to/bb-plugin","mode":"verify"}'
 ```
 
 Use `"mode":"release"` only when configured live checks and release actions are intended. Until a consumer removes a same-named local prototype, use the qualified ID shown above; afterward the ordinary `bb-plugin-release-gate` ID resolves to the installed pack.
 
-From the consumer's `.smithers` directory, start or inspect the durable Gateway with `bun x smithers gateway`, list runs with `bun x smithers ps`, inspect a run with `bun x smithers inspect RUN_ID`, and resume one with `bun x smithers resume RUN_ID`. The workflow UI is discovered from the installed pack by the Gateway.
+From the consumer root, start or inspect the durable Gateway with `./.smithers/node_modules/.bin/smithers gateway`, list runs with `./.smithers/node_modules/.bin/smithers ps`, inspect a run with `./.smithers/node_modules/.bin/smithers inspect RUN_ID`, and resume one with `./.smithers/node_modules/.bin/smithers resume RUN_ID`. Keeping the consumer root as the workspace makes native workflow discovery, run storage, and the Gateway UI agree.
 
 ## Develop
 

@@ -383,7 +383,9 @@ function requireBinding<T>(value: T | undefined): T {
 }
 
 export default smithers((ctx) => {
-  const pluginRoot = normalizeAbsolutePath(ctx.input.pluginRoot);
+  const pluginRoot = normalizeAbsolutePath(ctx.input?.pluginRoot ?? process.cwd());
+  const policyPathInput = ctx.input?.policyPath ?? ".bb/release-gate.json";
+  const mode = ctx.input?.mode ?? "verify";
   const loadPolicy = ctx.outputMaybe(outputs.loadPolicy, { nodeId: "load-policy" });
   const crossValidate = ctx.outputMaybe(outputs.crossValidate, { nodeId: "cross-validate" });
   const discoverEnv = ctx.outputMaybe(outputs.discoverEnv, { nodeId: "discover-env" });
@@ -473,7 +475,7 @@ export default smithers((ctx) => {
       <Sequence>
         <Task id="load-policy" output={outputs.loadPolicy} retries={0}>
           {async () => {
-            const policyPath = resolveInside(pluginRoot, ctx.input.policyPath);
+            const policyPath = resolveInside(pluginRoot, policyPathInput);
             const manifestPath = resolveInside(pluginRoot, "package.json");
             if (!(await Bun.file(manifestPath).exists())) throw new Error(`pluginRoot is not a BB plugin: ${pluginRoot}`);
             const parsedPolicy = parseReleaseGatePolicy(await readJsonFile(policyPath));
@@ -611,7 +613,7 @@ export default smithers((ctx) => {
         ) : null}
 
         <Branch
-          if={ctx.input.mode === "release" && report !== undefined && verdict?.verdict !== "fail"}
+          if={mode === "release" && report !== undefined && verdict?.verdict !== "fail"}
           then={
             <Sequence>
               {policy && packageManager ? (
