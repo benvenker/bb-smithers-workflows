@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "packageManager": "auto",
+  "staticChecks": [
+    { "id": "check", "executable": "$packageManager", "args": ["run", "check"] }
+  ],
+  "harness": {
+    "backend": { "executable": "$packageManager", "args": ["run", "harness:backend"] }
+  },
+  "harnessSources": {
+    "backend": ["server.test.ts"]
+  },
+  "build": { "executable": "$packageManager", "args": ["run", "build"] },
+  "artifacts": [
+    { "path": "package.json", "required": true, "minBytes": 1 }
+  ],
+  "liveChecks": [
+    {
+      "id": "mutating-smoke",
+      "command": { "executable": "node", "args": ["-e", "process.exit(0)"] },
+      "mutating": true,
+      "rollback": { "executable": "node", "args": ["-e", "process.exit(0)"] },
+      "verifyRollback": { "executable": "node", "args": ["-e", "process.exit(0)"] }
+    }
+  ],
+  "releaseActions": {
+    "commit": { "executable": "node", "args": ["-e", "process.exit(0)"] },
+    "push": { "executable": "node", "args": ["-e", "process.exit(0)"] },
+    "publish": { "executable": "node", "args": ["-e", "process.exit(0)"] },
+    "install": { "executable": "node", "args": ["-e", "process.exit(0)"] },
+    "reload": { "executable": "node", "args": ["-e", "process.exit(0)"] }
+  }
+}

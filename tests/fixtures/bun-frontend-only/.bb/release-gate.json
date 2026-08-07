@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "packageManager": "auto",
+  "staticChecks": [
+    { "id": "check", "executable": "$packageManager", "args": ["run", "check"] }
+  ],
+  "harness": {
+    "frontend": { "executable": "$packageManager", "args": ["run", "harness:frontend"] }
+  },
+  "harnessSources": {
+    "frontend": ["app.test.tsx"]
+  },
+  "build": { "executable": "$packageManager", "args": ["run", "build"] },
+  "artifacts": [
+    { "path": "package.json", "required": true, "minBytes": 1 }
+  ]
+}

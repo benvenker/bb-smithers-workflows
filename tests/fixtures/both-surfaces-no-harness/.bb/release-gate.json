@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "surfaces": ["backend", "frontend"],
+  "build": { "executable": "node", "args": ["-e", "process.exit(0)"] },
+  "waivers": [
+    {
+      "id": "temporary-frontend-harness",
+      "scope": "harness:frontend",
+      "reason": "Frontend harness migration is tracked and explicitly accepted for this fixture."
+    }
+  ]
+}

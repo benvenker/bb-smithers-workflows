@@ -1,0 +1,9 @@
+{
+  "name": "fixture-both-surfaces",
+  "version": "1.0.0",
+  "packageManager": "npm@11.0.0",
+  "bb": {
+    "server": "dist/server.js",
+    "app": "dist/app.js"
+  }
+}

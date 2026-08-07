@@ -1,0 +1,13 @@
+{
+  "name": "fixture-npm-backend",
+  "version": "1.0.0",
+  "packageManager": "npm@11.0.0",
+  "scripts": {
+    "check": "node -e \"process.exit(0)\"",
+    "harness:backend": "node -e \"process.exit(0)\"",
+    "build": "node -e \"process.exit(0)\""
+  },
+  "bb": {
+    "server": "dist/server.js"
+  }
+}

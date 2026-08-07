@@ -1,0 +1,12 @@
+name: bb-smithers-workflows
+version: 0.1.0
+description: Deterministic verification and gated release workflows for BB plugins.
+repository: https://github.com/benvenker/bb-smithers-workflows
+smithers: ^0.33.0
+contents:
+  workflows[1]: bb-plugin-release-gate
+  ui[1]: bb-plugin-release-gate
+capabilities:
+  bins[5]: bb,bun,git,npm,ubs
+  env: []
+  writes: repo
