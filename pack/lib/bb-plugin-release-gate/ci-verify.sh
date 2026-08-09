@@ -26,6 +26,10 @@ if [[ "$(ubs --version 2>/dev/null || true)" != *"v5.3.8"* ]]; then
   export PATH="${ci_tmp}:${PATH}"
 fi
 export UBS_NO_AUTO_UPDATE=1
+if ! command -v ast-grep >/dev/null 2>&1; then
+  npm install --prefix "${ci_tmp}/ast-grep" --no-audit --no-fund @ast-grep/cli@0.40.1
+  export PATH="${ci_tmp}/ast-grep/node_modules/.bin:${PATH}"
+fi
 ubs doctor --fix
 
 if [[ -f "${repo_root}/bun.lock" ]]; then
