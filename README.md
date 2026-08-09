@@ -48,8 +48,8 @@ Each consumer owns `.bb/release-gate.json`. Commands are executable/argv records
   },
   "releaseActions": {
     "install": { "executable": "bb", "args": ["plugin", "install", "git:https://github.com/example/plugin.git@main", "--yes", "--json"] },
-    "update": { "executable": "bb", "args": ["plugin", "update", "example", "--yes", "--json"] },
-    "reload": { "executable": "bb", "args": ["plugin", "reload", "example"] }
+    "update": { "executable": "bb", "args": ["plugin", "update", "example", "--yes"] },
+    "reload": { "executable": "bb", "args": ["plugin", "reload", "example", "--json"] }
   }
 }
 ```

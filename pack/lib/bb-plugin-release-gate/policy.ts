@@ -83,15 +83,16 @@ function commandTargetsHarnessSource(
   return sources.some((source) => args.has(normalizedPolicyPath(source)));
 }
 
-function isBbPluginCommand(
+function isExactBbPluginCommand(
   command: z.infer<typeof releaseGateCommandSchema>,
   operation: string,
   operand: string,
+  options: readonly string[],
 ): boolean {
+  const expectedArgs = ["plugin", operation, operand, ...options];
   return executableName(command) === "bb"
-    && command.args[0] === "plugin"
-    && command.args[1] === operation
-    && command.args[2] === operand;
+    && command.args.length === expectedArgs.length
+    && command.args.every((arg, index) => arg === expectedArgs[index]);
 }
 
 function verifyCommandMutationReason(command: z.infer<typeof releaseGateCommandSchema>): string | null {
@@ -194,14 +195,14 @@ export const releaseGatePolicySchema = z
     if (policy.rollout?.source) {
       const { pluginId, source } = policy.rollout;
       const { install, update, reload } = policy.releaseActions;
-      if (!install || !isBbPluginCommand(install, "install", source)) {
-        ctx.addIssue({ code: "custom", path: ["releaseActions", "install"], message: `managed rollout install must run bb plugin install ${source}` });
+      if (!install || !isExactBbPluginCommand(install, "install", source, ["--yes", "--json"])) {
+        ctx.addIssue({ code: "custom", path: ["releaseActions", "install"], message: `managed rollout install must run bb plugin install ${source} --yes --json` });
       }
-      if (!update || !isBbPluginCommand(update, "update", pluginId)) {
-        ctx.addIssue({ code: "custom", path: ["releaseActions", "update"], message: `managed rollout update must run bb plugin update ${pluginId}` });
+      if (!update || !isExactBbPluginCommand(update, "update", pluginId, ["--yes"])) {
+        ctx.addIssue({ code: "custom", path: ["releaseActions", "update"], message: `managed rollout update must run bb plugin update ${pluginId} --yes` });
       }
-      if (!reload || !isBbPluginCommand(reload, "reload", pluginId)) {
-        ctx.addIssue({ code: "custom", path: ["releaseActions", "reload"], message: `managed rollout reload must run bb plugin reload ${pluginId}` });
+      if (!reload || !isExactBbPluginCommand(reload, "reload", pluginId, ["--json"])) {
+        ctx.addIssue({ code: "custom", path: ["releaseActions", "reload"], message: `managed rollout reload must run bb plugin reload ${pluginId} --json` });
       }
     }
   });

@@ -196,7 +196,7 @@ function managedReleaseOutputs(mode: "absent" | "updatable" | "current"): Output
     rollout: { pluginId: "fixture-plugin", source },
     releaseActions: {
       install: { executable: "bb", args: ["plugin", "install", source, "--yes", "--json"] },
-      update: { executable: "bb", args: ["plugin", "update", "fixture-plugin", "--yes", "--json"] },
+      update: { executable: "bb", args: ["plugin", "update", "fixture-plugin", "--yes"] },
       reload: { executable: "bb", args: ["plugin", "reload", "fixture-plugin", "--json"] },
     },
   });
@@ -300,6 +300,30 @@ describe("bb-plugin-release-gate policy", () => {
       releaseGatePolicySchema.safeParse({
         ...policy,
         harness: { backend: { executable: "npm", args: ["test", "--", "some-other.test.ts"] } },
+      }).success,
+    ).toBe(false);
+  });
+
+  test("managed rollout commands reject unsupported trailing flags", () => {
+    const policy = fixture("npm-backend-only").policy;
+    const source = "git:https://github.com/example/plugin.git@main";
+    const managed = {
+      ...policy,
+      rollout: { pluginId: "example", source },
+      releaseActions: {
+        install: { executable: "bb", args: ["plugin", "install", source, "--yes", "--json"] },
+        update: { executable: "bb", args: ["plugin", "update", "example", "--yes"] },
+        reload: { executable: "bb", args: ["plugin", "reload", "example", "--json"] },
+      },
+    };
+    expect(releaseGatePolicySchema.safeParse(managed).success).toBe(true);
+    expect(
+      releaseGatePolicySchema.safeParse({
+        ...managed,
+        releaseActions: {
+          ...managed.releaseActions,
+          update: { executable: "bb", args: ["plugin", "update", "example", "--yes", "--json"] },
+        },
       }).success,
     ).toBe(false);
   });
