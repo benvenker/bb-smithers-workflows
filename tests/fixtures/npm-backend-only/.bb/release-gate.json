@@ -23,6 +23,7 @@
       "verifyRollback": { "executable": "node", "args": ["-e", "process.exit(0)"] }
     }
   ],
+  "rollout": { "pluginId": "fixture-plugin" },
   "releaseActions": {
     "commit": { "executable": "node", "args": ["-e", "process.exit(0)"] },
     "push": { "executable": "node", "args": ["-e", "process.exit(0)"] },

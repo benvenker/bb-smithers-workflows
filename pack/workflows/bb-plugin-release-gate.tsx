@@ -70,6 +70,16 @@ const staticGatesSchema = z.object({
   allPassed: z.boolean(),
 });
 
+const sdkFallbackSchema = z.object({
+  summary: z.string(),
+  status: z.enum(["not-applicable", "fallback-required", "fallback-missing", "official-available", "indeterminate"]),
+  dependencySpec: z.string().nullable(),
+  engineRange: z.string().nullable(),
+  officialVersion: z.string().nullable(),
+  migrationInstructions: z.string().nullable(),
+  outputTail: z.string(),
+});
+
 const harnessSchema = z.object({
   summary: z.string(),
   surface: z.enum(["backend", "frontend"]),
@@ -147,6 +157,20 @@ const releaseActionSchema = z.object({
   exitCode: z.number().int(),
   outputTail: z.string(),
 });
+const releasePlanSchema = z.object({
+  summary: z.string(),
+  pluginId: z.string(),
+  intendedRevision: z.string().regex(/^[a-f0-9]{40}$/),
+  actions: z.array(z.enum(["commit", "push", "publish", "install", "reload"])),
+});
+const rolloutVerificationSchema = z.object({
+  summary: z.string(),
+  pluginId: z.string(),
+  intendedRevision: z.string().regex(/^[a-f0-9]{40}$/),
+  installedRevision: z.string().nullable(),
+  ok: z.boolean(),
+  outputTail: z.string(),
+});
 const releaseReportSchema = z.object({
   summary: z.string(),
   verdict: z.enum(["pass", "waived"]),
@@ -158,6 +182,7 @@ export const releaseGateSchemas = {
   loadPolicy: loadPolicySchema,
   crossValidate: crossValidateSchema,
   discoverEnv: discoverEnvSchema,
+  sdkFallback: sdkFallbackSchema,
   staticGates: staticGatesSchema,
   harness: harnessSchema,
   build: buildSchema,
@@ -169,6 +194,8 @@ export const releaseGateSchemas = {
   approval: approvalSchema,
   bindingGuard: bindingGuardSchema,
   releaseAction: releaseActionSchema,
+  releasePlan: releasePlanSchema,
+  rolloutVerification: rolloutVerificationSchema,
   releaseReport: releaseReportSchema,
 } as const;
 
@@ -177,6 +204,7 @@ const { Workflow, Task, Sequence, Parallel, Branch, Approval, smithers, outputs 
   loadPolicy: loadPolicySchema,
   crossValidate: crossValidateSchema,
   discoverEnv: discoverEnvSchema,
+  sdkFallback: sdkFallbackSchema,
   staticGates: staticGatesSchema,
   harness: harnessSchema,
   build: buildSchema,
@@ -188,6 +216,9 @@ const { Workflow, Task, Sequence, Parallel, Branch, Approval, smithers, outputs 
   releaseApproval: approvalSchema,
   releaseGuard: bindingGuardSchema,
   releaseAction: releaseActionSchema,
+  releasePlan: releasePlanSchema,
+  rolloutVerification: rolloutVerificationSchema,
+  rolloutAssertion: bindingGuardSchema,
   releaseReport: releaseReportSchema,
 });
 
@@ -196,6 +227,7 @@ type HarnessEvidence = z.infer<typeof harnessSchema>;
 type LiveEvidence = z.infer<typeof liveCheckSchema>;
 type ReleaseAction = keyof ReleaseGatePolicy["releaseActions"];
 const RELEASE_ACTIONS: readonly ReleaseAction[] = ["commit", "push", "publish", "install", "reload"];
+const REQUIRED_ROLLOUT_ACTIONS: readonly ReleaseAction[] = ["install", "reload"];
 
 function parseJson<T>(value: string): T {
   return JSON.parse(value) as T;
@@ -323,6 +355,7 @@ async function artifactEvidence(pluginRoot: string, policy: ReleaseGatePolicy) {
 
 function verifyEvidenceSnapshot(args: {
   crossValidate: z.infer<typeof crossValidateSchema>;
+  sdkFallback: z.infer<typeof sdkFallbackSchema>;
   staticGates: z.infer<typeof staticGatesSchema>;
   harness: Partial<Record<ReleaseGateSurface, HarnessEvidence>>;
   build: z.infer<typeof buildSchema>;
@@ -333,12 +366,16 @@ function verifyEvidenceSnapshot(args: {
 
 function collectVerifyFailures(
   surfaces: ReleaseGateSurface[],
+  sdkFallback: z.infer<typeof sdkFallbackSchema>,
   staticGates: z.infer<typeof staticGatesSchema>,
   harness: Partial<Record<ReleaseGateSurface, HarnessEvidence>>,
   build: z.infer<typeof buildSchema>,
   inspection: z.infer<typeof inspectArtifactsSchema>,
 ) {
   const failures: Array<z.infer<typeof failureSchema>> = [];
+  if (sdkFallback.status === "official-available" || sdkFallback.status === "fallback-missing") {
+    failures.push({ scope: "sdk-fallback", message: sdkFallback.migrationInstructions ?? sdkFallback.summary });
+  }
   for (const check of staticGates.checks) {
     if (!check.ok) failures.push({ scope: `static:${check.id}`, message: `command failed with exit ${check.exitCode}` });
   }
@@ -354,6 +391,7 @@ function collectVerifyFailures(
 function renderReport(
   pluginName: string,
   verdict: z.infer<typeof verdictSchema>,
+  sdkFallback: z.infer<typeof sdkFallbackSchema>,
   staticGates: z.infer<typeof staticGatesSchema>,
   harness: Partial<Record<ReleaseGateSurface, HarnessEvidence>>,
   build: z.infer<typeof buildSchema>,
@@ -365,6 +403,7 @@ function renderReport(
     `Evidence SHA-256: \`${verdict.evidenceHash}\``,
     "",
     `- Static checks: ${staticGates.checks.filter((check) => check.ok).length}/${staticGates.checks.length} passed`,
+    `- SDK fallback: ${sdkFallback.summary}`,
     `- Backend harness: ${harness.backend ? (harness.backend.ok ? "passed" : "failed") : "not applicable"}`,
     `- Frontend harness: ${harness.frontend ? (harness.frontend.ok ? "passed" : "failed") : "not applicable"}`,
     `- Build: ${build.ok ? "passed" : "failed"}`,
@@ -378,6 +417,106 @@ function renderReport(
   return lines.join("\n");
 }
 
+export async function inspectSdkFallback(
+  pluginRoot: string,
+  manifest: Record<string, unknown>,
+  registryExecutable = "npm",
+): Promise<z.infer<typeof sdkFallbackSchema>> {
+  const devDependencies =
+    manifest.devDependencies && typeof manifest.devDependencies === "object" && !Array.isArray(manifest.devDependencies)
+      ? (manifest.devDependencies as Record<string, unknown>)
+      : {};
+  const dependencySpec = typeof devDependencies["@bb/plugin-sdk"] === "string" ? devDependencies["@bb/plugin-sdk"] : null;
+  if (!dependencySpec?.startsWith("file:")) {
+    return {
+      summary: "no vendored SDK fallback",
+      status: "not-applicable",
+      dependencySpec,
+      engineRange: null,
+      officialVersion: null,
+      migrationInstructions: null,
+      outputTail: "",
+    };
+  }
+
+  const engines = manifest.engines && typeof manifest.engines === "object" && !Array.isArray(manifest.engines)
+    ? (manifest.engines as Record<string, unknown>)
+    : {};
+  const engineRange = typeof engines.bbPluginSdk === "string" ? engines.bbPluginSdk : null;
+  const tarballPath = dependencySpec.slice("file:".length);
+  const migration = engineRange
+    ? `Official @bb/plugin-sdk is compatible with engines.bbPluginSdk ${engineRange}. Replace ${dependencySpec} with ${engineRange}, regenerate the lockfile, run tests against the registry package, then delete the vendored tarball and any @bb/plugin-sdk type-path shims.`
+    : "A vendored @bb/plugin-sdk fallback requires engines.bbPluginSdk so compatibility with an official release can be checked.";
+  if (!engineRange || !(await Bun.file(resolveInside(pluginRoot, tarballPath)).exists())) {
+    return {
+      summary: !engineRange ? "vendored SDK fallback has no compatibility range" : `vendored SDK tarball is missing: ${tarballPath}`,
+      status: "fallback-missing",
+      dependencySpec,
+      engineRange,
+      officialVersion: null,
+      migrationInstructions: migration,
+      outputTail: "",
+    };
+  }
+
+  const check = await runCommand(
+    { executable: registryExecutable, args: ["view", `@bb/plugin-sdk@${engineRange}`, "version", "--json"], timeoutMs: 30_000 },
+    "npm",
+    pluginRoot,
+    "sdk-fallback-expiry",
+  );
+  if (check.ok) {
+    let officialVersion: string | null = null;
+    try {
+      const parsed = JSON.parse(check.outputTail) as unknown;
+      officialVersion = typeof parsed === "string" ? parsed : Array.isArray(parsed) && typeof parsed.at(-1) === "string" ? parsed.at(-1)! : null;
+    } catch {
+      officialVersion = check.outputTail.trim() || null;
+    }
+    return {
+      summary: `compatible official SDK ${officialVersion ?? "published"} is available; remove the vendored fallback`,
+      status: "official-available",
+      dependencySpec,
+      engineRange,
+      officialVersion,
+      migrationInstructions: migration,
+      outputTail: check.outputTail,
+    };
+  }
+  if (/\bE404\b|\b404\b|not found/iu.test(check.outputTail)) {
+    return {
+      summary: `official SDK is not published for ${engineRange}; vendored fallback remains required`,
+      status: "fallback-required",
+      dependencySpec,
+      engineRange,
+      officialVersion: null,
+      migrationInstructions: null,
+      outputTail: check.outputTail,
+    };
+  }
+  return {
+    summary: "official SDK publication check was indeterminate",
+    status: "indeterminate",
+    dependencySpec,
+    engineRange,
+    officialVersion: null,
+    migrationInstructions: null,
+    outputTail: check.outputTail,
+  };
+}
+
+export function parseInstalledRevision(output: string): string | null {
+  try {
+    const start = output.indexOf("{");
+    const end = output.lastIndexOf("}");
+    const parsed = JSON.parse(output.slice(start, end + 1)) as { history?: Array<{ version?: unknown }> };
+    const version = parsed.history?.[0]?.version;
+    return typeof version === "string" && /^[a-f0-9]{40}$/u.test(version) ? version : null;
+  } catch {
+    return null;
+  }
+}
+
 function requireBinding<T>(value: T | undefined): T {
   return value as T;
 }
@@ -389,6 +528,7 @@ export default smithers((ctx) => {
   const loadPolicy = ctx.outputMaybe(outputs.loadPolicy, { nodeId: "load-policy" });
   const crossValidate = ctx.outputMaybe(outputs.crossValidate, { nodeId: "cross-validate" });
   const discoverEnv = ctx.outputMaybe(outputs.discoverEnv, { nodeId: "discover-env" });
+  const sdkFallback = ctx.outputMaybe(outputs.sdkFallback, { nodeId: "sdk-fallback" });
   const staticGates = ctx.outputMaybe(outputs.staticGates, { nodeId: "static-gates" });
   const backendHarness = ctx.outputMaybe(outputs.harness, { nodeId: "harness-backend" });
   const frontendHarness = ctx.outputMaybe(outputs.harness, { nodeId: "harness-frontend" });
@@ -396,9 +536,12 @@ export default smithers((ctx) => {
   const inspection = ctx.outputMaybe(outputs.inspectArtifacts, { nodeId: "inspect-artifacts" });
   const verdict = ctx.outputMaybe(outputs.verdict, { nodeId: "verdict" });
   const report = ctx.outputMaybe(outputs.report, { nodeId: "report" });
+  const gateAssertion = ctx.outputMaybe(outputs.releaseGuard, { nodeId: "gate-assertion" });
   const acceptance = ctx.outputMaybe(outputs.acceptanceVerdict, { nodeId: "acceptance-verdict" });
   const releaseApproval = ctx.outputMaybe(outputs.releaseApproval, { nodeId: "release-approval" });
   const releaseGuard = ctx.outputMaybe(outputs.releaseGuard, { nodeId: "release-guard" });
+  const releasePlan = ctx.outputMaybe(outputs.releasePlan, { nodeId: "release-plan" });
+  const rolloutVerification = ctx.outputMaybe(outputs.rolloutVerification, { nodeId: "rollout-verification" });
 
   const policy = loadPolicy ? parseReleaseGatePolicy(parseJson(loadPolicy.policyJson)) : undefined;
   const packageManager = discoverEnv?.packageManager;
@@ -408,7 +551,7 @@ export default smithers((ctx) => {
     ...(frontendHarness ? { frontend: frontendHarness } : {}),
   };
   const verifyReady = Boolean(
-    crossValidate && staticGates && build && inspection && surfaces.every((surface) => harnessBySurface[surface] !== undefined),
+    crossValidate && sdkFallback && staticGates && build && inspection && surfaces.every((surface) => harnessBySurface[surface] !== undefined),
   );
 
   const liveResults = new Map<string, LiveEvidence>();
@@ -502,8 +645,14 @@ export default smithers((ctx) => {
           </Task>
         ) : null}
 
-        {crossValidate && policy ? (
-          <Task id="discover-env" output={outputs.discoverEnv} dependsOn={["cross-validate"]} retries={0}>
+        {crossValidate && loadPolicy ? (
+          <Task id="sdk-fallback" output={outputs.sdkFallback} dependsOn={["cross-validate"]} retries={0}>
+            {() => inspectSdkFallback(pluginRoot, parseJson<Record<string, unknown>>(loadPolicy.manifestJson))}
+          </Task>
+        ) : null}
+
+        {crossValidate && sdkFallback && policy ? (
+          <Task id="discover-env" output={outputs.discoverEnv} dependsOn={["sdk-fallback"]} retries={0}>
             {async () => {
               if (!crossValidate.ok) throw new Error(`Policy/manifest contradiction: ${crossValidate.issues.join("; ")}`);
               const manifest = parseJson<Record<string, unknown>>(loadPolicy?.manifestJson ?? "{}");
@@ -577,11 +726,11 @@ export default smithers((ctx) => {
           </Task>
         ) : null}
 
-        {verifyReady && policy && crossValidate && staticGates && build && inspection ? (
+        {verifyReady && policy && crossValidate && sdkFallback && staticGates && build && inspection ? (
           <Task id="verdict" output={outputs.verdict} dependsOn={["inspect-artifacts"]} retries={0}>
             {() => {
-              const snapshot = verifyEvidenceSnapshot({ crossValidate, staticGates, harness: harnessBySurface, build, inspectArtifacts: inspection });
-              const failures = collectVerifyFailures(surfaces, staticGates, harnessBySurface, build, inspection);
+              const snapshot = verifyEvidenceSnapshot({ crossValidate, sdkFallback, staticGates, harness: harnessBySurface, build, inspectArtifacts: inspection });
+              const failures = collectVerifyFailures(surfaces, sdkFallback, staticGates, harnessBySurface, build, inspection);
               const waivers = policy.waivers.filter((waiver) => isWaiverCurrent(waiver.expiresAt));
               const blockingFailures: typeof failures = [];
               const waivedItems: Array<z.infer<typeof waivedItemSchema>> = [];
@@ -603,23 +752,53 @@ export default smithers((ctx) => {
           </Task>
         ) : null}
 
-        {verdict && staticGates && build ? (
+        {verdict && sdkFallback && staticGates && build ? (
           <Task id="report" output={outputs.report} dependsOn={["verdict"]} retries={0}>
             {() => ({
               summary: `${verdict.verdict.toUpperCase()} release-gate report`,
-              markdownReport: renderReport(loadPolicy?.pluginName ?? "BB plugin", verdict, staticGates, harnessBySurface, build),
+              markdownReport: renderReport(loadPolicy?.pluginName ?? "BB plugin", verdict, sdkFallback, staticGates, harnessBySurface, build),
             })}
           </Task>
         ) : null}
 
+        {report && verdict ? (
+          <Task id="gate-assertion" output={outputs.releaseGuard} dependsOn={["report"]} retries={0}>
+            {() => {
+              if (verdict.verdict === "fail") {
+                throw new Error(`Release gate failed: ${verdict.blockingFailures.map((failure) => `${failure.scope}: ${failure.message}`).join("; ")}`);
+              }
+              return { summary: "Release-gate verdict permits continuation", ok: true, boundHash: verdict.evidenceHash };
+            }}
+          </Task>
+        ) : null}
+
         <Branch
-          if={mode === "release" && report !== undefined && verdict?.verdict !== "fail"}
+          if={mode === "release" && gateAssertion !== undefined && verdict?.verdict !== "fail"}
           then={
             <Sequence>
+              {policy ? (
+                <Task id="release-plan" output={outputs.releasePlan} dependsOn={["gate-assertion"]} retries={0}>
+                  {async () => {
+                    if (!policy.rollout) throw new Error("Release mode requires rollout.pluginId");
+                    const missing = REQUIRED_ROLLOUT_ACTIONS.filter((action) => policy.releaseActions[action] === undefined);
+                    if (missing.length > 0) throw new Error(`Release mode requires configured rollout actions: ${missing.join(", ")}`);
+                    const revision = await runCommand(
+                      { executable: "git", args: ["rev-parse", "HEAD"], timeoutMs: 30_000 },
+                      packageManager ?? "npm",
+                      pluginRoot,
+                      "release-revision",
+                    );
+                    const intendedRevision = revision.outputTail.trim();
+                    if (!revision.ok || !/^[a-f0-9]{40}$/u.test(intendedRevision)) throw new Error(`Cannot resolve intended release revision: ${revision.outputTail}`);
+                    return { summary: `Roll out ${policy.rollout.pluginId} at ${intendedRevision}`, pluginId: policy.rollout.pluginId, intendedRevision, actions: configuredActions };
+                  }}
+                </Task>
+              ) : null}
+
               {policy && packageManager ? (
                 <Parallel maxConcurrency={1}>
                   {policy.liveChecks.map((check) => (
-                    <Task key={check.id} id={`live-${check.id}`} output={outputs.liveCheck} dependsOn={["report"]} retries={0}>
+                    <Task key={check.id} id={`live-${check.id}`} output={outputs.liveCheck} dependsOn={["release-plan"]} retries={0}>
                       {async () => {
                         const checkEvidence = await runCommand(check.command, packageManager, pluginRoot, `live-${check.id}`);
                         let rollbackExecuted = false;
@@ -655,7 +834,7 @@ export default smithers((ctx) => {
                 <Task
                   id="acceptance-verdict"
                   output={outputs.acceptanceVerdict}
-                  dependsOn={policy.liveChecks.length > 0 ? policy.liveChecks.map((check) => `live-${check.id}`) : ["report"]}
+                  dependsOn={policy.liveChecks.length > 0 ? policy.liveChecks.map((check) => `live-${check.id}`) : ["release-plan"]}
                   retries={0}
                 >
                   {() => {
@@ -739,13 +918,48 @@ export default smithers((ctx) => {
 
                   {releaseGuard && releaseActionsReady ? (
                     <Task
-                      id="release-report"
-                      output={outputs.releaseReport}
+                      id="rollout-verification"
+                      output={outputs.rolloutVerification}
                       dependsOn={[configuredActions.length > 0 ? `release-${configuredActions.at(-1)}` : "release-guard"]}
                       retries={0}
                     >
+                      {async () => {
+                        if (!releasePlan) throw new Error("Release plan evidence is missing");
+                        const source = await runCommand(
+                          { executable: "bb", args: ["plugin", "source", releasePlan.pluginId, "--json"], timeoutMs: 60_000 },
+                          packageManager ?? "npm",
+                          pluginRoot,
+                          "rollout-verification",
+                        );
+                        const installedRevision = source.ok ? parseInstalledRevision(source.outputTail) : null;
+                        const ok = source.ok && installedRevision === releasePlan.intendedRevision;
+                        return {
+                          summary: ok
+                            ? `Installed ${releasePlan.pluginId} revision matches ${releasePlan.intendedRevision}`
+                            : `Installed ${releasePlan.pluginId} revision ${installedRevision ?? "unknown"} does not match ${releasePlan.intendedRevision}`,
+                          pluginId: releasePlan.pluginId,
+                          intendedRevision: releasePlan.intendedRevision,
+                          installedRevision,
+                          ok,
+                          outputTail: source.outputTail,
+                        };
+                      }}
+                    </Task>
+                  ) : null}
+
+                  {rolloutVerification ? (
+                    <Task id="rollout-assertion" output={outputs.rolloutAssertion} dependsOn={["rollout-verification"]} retries={0}>
+                      {() => {
+                        if (!rolloutVerification.ok) throw new Error(rolloutVerification.summary);
+                        return { summary: rolloutVerification.summary, ok: true, boundHash: rolloutVerification.intendedRevision };
+                      }}
+                    </Task>
+                  ) : null}
+
+                  {rolloutVerification?.ok ? (
+                    <Task id="release-report" output={outputs.releaseReport} dependsOn={["rollout-assertion"]} retries={0}>
                       {() => ({
-                        summary: `Release completed with ${configuredActions.length} configured actions`,
+                        summary: `Release completed with ${configuredActions.length} configured actions; ${rolloutVerification.summary}`,
                         verdict: verdict?.verdict === "waived" ? "waived" : "pass",
                         artifact: `smithers://outputs/${ctx.runId}/release-report`,
                       })}

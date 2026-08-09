@@ -52,6 +52,10 @@ Verify commands reject shell wrappers, Git/GitHub commands, package installation
 
 Mutating `liveChecks` must declare a rollback; `verifyRollback` is optional. `releaseActions` run only in explicit release mode after verification and live acceptance pass. Set `requireReleaseApproval` to `false` only when the consumer intentionally does not need the one final Smithers approval.
 
+Release mode also requires `rollout.pluginId` plus `install` and `reload` actions. It captures the consumer's `HEAD`, runs the configured rollout, then refuses success unless `bb plugin source <id> --json` reports that exact revision as active.
+
+Consumers temporarily using `file:vendor/*.tgz` for `@bb/plugin-sdk` are checked against `engines.bbPluginSdk` on every gate run. The gate fails with migration instructions as soon as a compatible official package exists; registry outages are reported as indeterminate.
+
 ## Run
 
 ```bash

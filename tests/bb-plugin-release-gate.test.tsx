@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,7 +7,12 @@ import { addPack } from "@smthrs/cli/packs";
 import { discoverWorkflows, resolveWorkflow } from "@smthrs/cli/workflows";
 import type { TaskDescriptor } from "smthrs";
 import { renderWorkflow } from "smthrs/testing";
-import workflow, { releaseGatePolicySchema, releaseGateSchemas } from "../pack/workflows/bb-plugin-release-gate";
+import workflow, {
+  inspectSdkFallback,
+  parseInstalledRevision,
+  releaseGatePolicySchema,
+  releaseGateSchemas,
+} from "../pack/workflows/bb-plugin-release-gate";
 import {
   inspectOfficialHarnessSources,
   parseReleaseGatePolicy,
@@ -69,6 +74,17 @@ function stageOutputs(name: string): OutputSnapshot {
         resolvedWaiverIds: data.policy.waivers.map((waiver) => waiver.id),
       }),
     ],
+    sdkFallback: [
+      row("sdk-fallback", {
+        summary: "no vendored SDK fallback",
+        status: "not-applicable",
+        dependencySpec: null,
+        engineRange: null,
+        officialVersion: null,
+        migrationInstructions: null,
+        outputTail: "",
+      }),
+    ],
     discoverEnv: [
       row("discover-env", {
         summary: "commands resolved",
@@ -91,6 +107,7 @@ function stageOutputs(name: string): OutputSnapshot {
       }),
     ],
     report: [row("report", { summary: "verify report", markdownReport: `# PASS\n\nEvidence hash: ${"a".repeat(64)}` })],
+    releaseGuard: [row("gate-assertion", { summary: "permitted", ok: true, boundHash: "a".repeat(64) })],
   };
 }
 
@@ -133,10 +150,32 @@ function releaseOutputs(name: string, requireApproval = true): OutputSnapshot {
           ],
         }
       : {}),
-    releaseGuard: [row("release-guard", { summary: "current", ok: true, boundHash: "b".repeat(64) })],
+    releaseGuard: [
+      row("gate-assertion", { summary: "permitted", ok: true, boundHash: "a".repeat(64) }),
+      row("release-guard", { summary: "current", ok: true, boundHash: "b".repeat(64) }),
+    ],
+    releasePlan: [
+      row("release-plan", {
+        summary: "roll out fixture",
+        pluginId: "fixture-plugin",
+        intendedRevision: "d".repeat(40),
+        actions: ["commit", "push", "publish", "install", "reload"],
+      }),
+    ],
     releaseAction: ["commit", "push", "publish", "install", "reload"].map((action) =>
       row(`release-${action}`, { summary: `${action} passed`, action, ok: true, exitCode: 0, outputTail: "ok" }),
     ),
+    rolloutVerification: [
+      row("rollout-verification", {
+        summary: "installed revision matches",
+        pluginId: "fixture-plugin",
+        intendedRevision: "d".repeat(40),
+        installedRevision: "d".repeat(40),
+        ok: true,
+        outputTail: "{}",
+      }),
+    ],
+    rolloutAssertion: [row("rollout-assertion", { summary: "matched", ok: true, boundHash: "d".repeat(40) })],
     releaseReport: [
       row("release-report", { summary: "release passed", verdict: "pass", artifact: "smithers://outputs/test/release-report" }),
     ],
@@ -155,6 +194,46 @@ async function render(name: string, mode: "verify" | "release", outputs: OutputS
     baseRootDir: resolve(here, ".."),
     workflowPath: resolve(here, "../pack/workflows/bb-plugin-release-gate.tsx"),
   });
+}
+
+async function runInstalledGate(name: string, mode: "verify" | "release", mutatePolicy?: (policy: Record<string, unknown>) => void) {
+  const pluginRoot = mkdtempSync(join(resolve(here, ".."), ".tmp-gate-process-"));
+  try {
+    cpSync(resolve(fixturesRoot, name), pluginRoot, { recursive: true });
+    if (mutatePolicy) {
+      const policyPath = join(pluginRoot, ".bb", "release-gate.json");
+      const policy = JSON.parse(readFileSync(policyPath, "utf8")) as Record<string, unknown>;
+      mutatePolicy(policy);
+      writeFileSync(policyPath, `${JSON.stringify(policy, null, 2)}\n`);
+    }
+    mkdirSync(join(pluginRoot, ".smithers"), { recursive: true });
+    await addPack(`file:${packRoot}`, { from: pluginRoot, yes: true });
+    const cli = resolve(here, "../node_modules/.bin/smithers");
+    const child = Bun.spawn(
+      [
+        cli,
+        "workflow",
+        "run",
+        "bb-smithers-workflows:bb-plugin-release-gate",
+        "--run-id",
+        `gate-process-${crypto.randomUUID()}`,
+        "--input",
+        JSON.stringify({ pluginRoot, mode }),
+        "--no-post-failure",
+        "--no-monitor",
+        "--no-report",
+      ],
+      { cwd: pluginRoot, env: { ...process.env, SMITHERS_POST_FAILURE: "0", SMITHERS_NO_REPORT: "1" }, stdout: "pipe", stderr: "pipe" },
+    );
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    return { exitCode, output: `${stdout}\n${stderr}` };
+  } finally {
+    rmSync(pluginRoot, { recursive: true, force: true });
+  }
 }
 
 describe("bb-plugin-release-gate policy", () => {
@@ -194,6 +273,31 @@ describe("bb-plugin-release-gate policy", () => {
       verifiedSourcePaths: [],
     });
   });
+
+  test("vendored SDK fallback expires when a compatible official package appears", async () => {
+    const root = mkdtempSync(join(resolve(here, ".."), ".tmp-sdk-fallback-"));
+    try {
+      mkdirSync(join(root, "vendor"), { recursive: true });
+      writeFileSync(join(root, "vendor", "sdk.tgz"), "fixture");
+      const registry = join(root, "registry-check");
+      writeFileSync(registry, "#!/bin/sh\nprintf '\"0.4.2\"\\n'\n");
+      chmodSync(registry, 0o755);
+      const result = await inspectSdkFallback(
+        root,
+        { engines: { bbPluginSdk: "^0.4.1" }, devDependencies: { "@bb/plugin-sdk": "file:vendor/sdk.tgz" } },
+        registry,
+      );
+      expect(result).toMatchObject({ status: "official-available", officialVersion: "0.4.2" });
+      expect(result.migrationInstructions).toContain("Replace file:vendor/sdk.tgz with ^0.4.1");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("installed revision parsing requires the active full SHA", () => {
+    expect(parseInstalledRevision(JSON.stringify({ history: [{ version: "e".repeat(40) }] }))).toBe("e".repeat(40));
+    expect(parseInstalledRevision(JSON.stringify({ history: [{ version: "main" }] }))).toBeNull();
+  });
 });
 
 describe("bb-plugin-release-gate graph", () => {
@@ -215,6 +319,7 @@ describe("bb-plugin-release-gate graph", () => {
       expect.arrayContaining([
         "load-policy",
         "cross-validate",
+        "sdk-fallback",
         "discover-env",
         "static-gates",
         "harness-backend",
@@ -222,6 +327,7 @@ describe("bb-plugin-release-gate graph", () => {
         "inspect-artifacts",
         "verdict",
         "report",
+        "gate-assertion",
       ]),
     );
     expect(ids).not.toContain("harness-frontend");
@@ -236,6 +342,7 @@ describe("bb-plugin-release-gate graph", () => {
     expect(tasks.get("report")?.agent).toBeUndefined();
     expect(tasks.get("build")?.dependsOn).toContain("harness-backend");
     expect(tasks.get("report")?.dependsOn).toContain("verdict");
+    expect(tasks.get("gate-assertion")?.dependsOn).toContain("report");
   });
 
   test("applicable backend, frontend, and dual-surface branches render from the real module", async () => {
@@ -259,22 +366,27 @@ describe("bb-plugin-release-gate graph", () => {
         "acceptance-verdict",
         "release-approval",
         "release-guard",
+        "release-plan",
         "release-commit",
         "release-push",
         "release-publish",
         "release-install",
         "release-reload",
+        "rollout-verification",
+        "rollout-assertion",
         "release-report",
       ]),
     );
     const approvals = graph.tasks.filter((task) => task.needsApproval);
     expect(approvals.map((task) => task.nodeId)).toEqual(["release-approval"]);
     expect(approvals[0]?.proofBindingRequired).toBe(true);
-    expect(tasks.get("live-mutating-smoke")?.dependsOn).toContain("report");
+    expect(tasks.get("release-plan")?.dependsOn).toContain("gate-assertion");
+    expect(tasks.get("live-mutating-smoke")?.dependsOn).toContain("release-plan");
     expect(tasks.get("release-approval")?.dependsOn).toContain("acceptance-verdict");
     expect(tasks.get("release-guard")?.dependsOn).toContain("release-approval");
     expect(tasks.get("release-push")?.dependsOn).toContain("release-commit");
-    expect(tasks.get("release-report")?.dependsOn).toContain("release-reload");
+    expect(tasks.get("rollout-verification")?.dependsOn).toContain("release-reload");
+    expect(tasks.get("release-report")?.dependsOn).toContain("rollout-assertion");
   });
 
   test("policy can intentionally omit the final approval without changing release ordering", async () => {
@@ -298,6 +410,7 @@ describe("bb-plugin-release-gate graph", () => {
         reportArtifact: "smithers://outputs/test/verdict",
       }),
     ];
+    outputs.releaseGuard = [];
     const graph = await render("npm-backend-only", "release", outputs);
     expect([...taskMap(graph).keys()].filter((id) => /^(live-|release-)/.test(id))).toEqual([]);
   });
@@ -313,6 +426,7 @@ describe("native pack installation", () => {
       expect(installed.manifest.capabilities.writes).toBe("repo");
       expect(existsSync(join(consumerRoot, ".smithers", "packs.lock.toon"))).toBe(true);
       expect(existsSync(join(installed.path, "ui", "bb-plugin-release-gate.tsx"))).toBe(true);
+      expect(existsSync(join(installed.path, "lib", "bb-plugin-release-gate", "ci-verify.sh"))).toBe(true);
       expect(discoverWorkflows(consumerRoot).some((entry) => entry.id === "bb-plugin-release-gate")).toBe(true);
       expect(resolveWorkflow("bb-smithers-workflows:bb-plugin-release-gate", consumerRoot).entryFile).toBe(
         join(installed.path, "workflows", "bb-plugin-release-gate.tsx"),
@@ -321,4 +435,21 @@ describe("native pack installation", () => {
       rmSync(consumerRoot, { recursive: true, force: true });
     }
   });
+
+  test("the installed workflow exits zero on pass and nonzero after a reported failing verdict", async () => {
+    const passed = await runInstalledGate("npm-backend-only", "verify");
+    expect(passed.exitCode).toBe(0);
+
+    const failed = await runInstalledGate("npm-backend-only", "verify", (policy) => {
+      policy.staticChecks = [{ id: "planted-failure", executable: "node", args: ["-e", "process.exit(9)"] }];
+    });
+    expect(failed.exitCode).not.toBe(0);
+    expect(failed.output).toContain("Release gate failed");
+  }, 60_000);
+
+  test("release mode exits nonzero when real rollout configuration is absent", async () => {
+    const result = await runInstalledGate("bun-frontend-only", "release");
+    expect(result.exitCode).not.toBe(0);
+    expect(result.output).toContain("Release mode requires rollout.pluginId");
+  }, 60_000);
 });

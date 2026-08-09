@@ -60,6 +60,12 @@ export const releaseGateLiveCheckSchema = z
     }
   });
 
+export const releaseGateRolloutSchema = z
+  .object({
+    pluginId: z.string().regex(/^[a-z0-9][a-z0-9-]*$/),
+  })
+  .strict();
+
 function verifyCommandMutationReason(command: z.infer<typeof releaseGateCommandSchema>): string | null {
   const executable = command.executable.split(/[\\/]/).at(-1)?.toLowerCase() ?? command.executable.toLowerCase();
   const args = command.args.map((arg) => arg.toLowerCase());
@@ -102,6 +108,7 @@ export const releaseGatePolicySchema = z
     waivers: z.array(releaseGateWaiverSchema).default([]),
     liveChecks: z.array(releaseGateLiveCheckSchema).default([]),
     requireReleaseApproval: z.boolean().default(true),
+    rollout: releaseGateRolloutSchema.optional(),
     releaseActions: z
       .object({
         commit: releaseGateCommandSchema.optional(),
