@@ -26,6 +26,7 @@ if [[ "$(ubs --version 2>/dev/null || true)" != *"v5.3.8"* ]]; then
   export PATH="${ci_tmp}:${PATH}"
 fi
 export UBS_NO_AUTO_UPDATE=1
+ubs doctor --fix
 
 if [[ -f "${repo_root}/bun.lock" ]]; then
   bun install --frozen-lockfile
