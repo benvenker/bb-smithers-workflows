@@ -8,7 +8,7 @@ if [[ ! -f "${repo_root}/package.json" || ! -x "${repo_root}/.smithers/node_modu
 fi
 
 ci_tmp="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/bb-plugin-release-gate.XXXXXX")"
-mkdir -p "${ci_tmp}/bun" "${ci_tmp}/npm"
+mkdir -p "${ci_tmp}/bun" "${ci_tmp}/npm" "${ci_tmp}/smithers-bun"
 export BUN_TMPDIR="${ci_tmp}/bun"
 export npm_config_cache="${ci_tmp}/npm"
 
@@ -36,7 +36,7 @@ else
   exit 2
 fi
 
-bun install --cwd .smithers --frozen-lockfile
+BUN_TMPDIR="${ci_tmp}/smithers-bun" bun install --cwd .smithers --frozen-lockfile
 exec .smithers/node_modules/.bin/smithers workflow run \
   bb-smithers-workflows:bb-plugin-release-gate \
   --input "{\"pluginRoot\":\"${repo_root}\",\"mode\":\"verify\"}" \
