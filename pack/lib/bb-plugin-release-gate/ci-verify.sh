@@ -7,7 +7,7 @@ if [[ ! -f "${repo_root}/package.json" || ! -x "${repo_root}/.smithers/node_modu
   exit 2
 fi
 
-ci_tmp="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/bb-plugin-release-gate"
+ci_tmp="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/bb-plugin-release-gate-${GITHUB_RUN_ID:-$$}"
 mkdir -p "${ci_tmp}/bun" "${ci_tmp}/npm"
 export BUN_TMPDIR="${ci_tmp}/bun"
 export npm_config_cache="${ci_tmp}/npm"
