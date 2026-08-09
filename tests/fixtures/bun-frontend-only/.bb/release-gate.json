@@ -5,7 +5,7 @@
     { "id": "check", "executable": "$packageManager", "args": ["run", "check"] }
   ],
   "harness": {
-    "frontend": { "executable": "$packageManager", "args": ["run", "harness:frontend"] }
+    "frontend": { "executable": "$packageManager", "args": ["run", "harness:frontend", "--", "app.test.tsx"] }
   },
   "harnessSources": {
     "frontend": ["app.test.tsx"]

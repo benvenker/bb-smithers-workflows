@@ -63,11 +63,39 @@ export const releaseGateLiveCheckSchema = z
 export const releaseGateRolloutSchema = z
   .object({
     pluginId: z.string().regex(/^[a-z0-9][a-z0-9-]*$/),
+    source: z.string().min(1).optional(),
   })
   .strict();
 
+function executableName(command: z.infer<typeof releaseGateCommandSchema>): string {
+  return command.executable.split(/[\\/]/).at(-1)?.toLowerCase() ?? command.executable.toLowerCase();
+}
+
+function normalizedPolicyPath(value: string): string {
+  return value.replaceAll("\\", "/").replace(/^\.\//u, "");
+}
+
+function commandTargetsHarnessSource(
+  command: z.infer<typeof releaseGateCommandSchema>,
+  sources: readonly string[],
+): boolean {
+  const args = new Set(command.args.map(normalizedPolicyPath));
+  return sources.some((source) => args.has(normalizedPolicyPath(source)));
+}
+
+function isBbPluginCommand(
+  command: z.infer<typeof releaseGateCommandSchema>,
+  operation: string,
+  operand: string,
+): boolean {
+  return executableName(command) === "bb"
+    && command.args[0] === "plugin"
+    && command.args[1] === operation
+    && command.args[2] === operand;
+}
+
 function verifyCommandMutationReason(command: z.infer<typeof releaseGateCommandSchema>): string | null {
-  const executable = command.executable.split(/[\\/]/).at(-1)?.toLowerCase() ?? command.executable.toLowerCase();
+  const executable = executableName(command);
   const args = command.args.map((arg) => arg.toLowerCase());
   const first = args[0] ?? "";
   if (["sh", "bash", "zsh", "fish", "pwsh", "powershell", "cmd", "npx", "bunx"].includes(executable)) {
@@ -80,7 +108,7 @@ function verifyCommandMutationReason(command: z.infer<typeof releaseGateCommandS
   if (executable === "bun" && ["install", "i", "add", "remove", "update", "publish", "x"].includes(first)) {
     return `bun ${first} is not allowed in verify mode`;
   }
-  if (executable === "bb" && args[0] === "plugin" && ["install", "reload", "dev", "config"].includes(args[1] ?? "")) {
+  if (executable === "bb" && args[0] === "plugin" && ["install", "update", "reload", "remove", "enable", "disable", "dev", "config"].includes(args[1] ?? "")) {
     return `bb plugin ${args[1]} is a live mutation and belongs only in release actions`;
   }
   return null;
@@ -115,6 +143,7 @@ export const releaseGatePolicySchema = z
         push: releaseGateCommandSchema.optional(),
         publish: releaseGateCommandSchema.optional(),
         install: releaseGateCommandSchema.optional(),
+        update: releaseGateCommandSchema.optional(),
         reload: releaseGateCommandSchema.optional(),
       })
       .strict()
@@ -142,6 +171,13 @@ export const releaseGatePolicySchema = z
           message: `${surface} harness commands require at least one declared source path`,
         });
       }
+      if (policy.harness[surface] && sources.length > 0 && !commandTargetsHarnessSource(policy.harness[surface], sources)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["harness", surface],
+          message: `${surface} harness command must target at least one declared harness source`,
+        });
+      }
       if (new Set(sources).size !== sources.length) {
         ctx.addIssue({ code: "custom", path: ["harnessSources", surface], message: `${surface} harness source paths must be unique` });
       }
@@ -154,6 +190,19 @@ export const releaseGatePolicySchema = z
     for (const entry of verifyCommands) {
       const reason = verifyCommandMutationReason(entry.command);
       if (reason) ctx.addIssue({ code: "custom", path: entry.path, message: reason });
+    }
+    if (policy.rollout?.source) {
+      const { pluginId, source } = policy.rollout;
+      const { install, update, reload } = policy.releaseActions;
+      if (!install || !isBbPluginCommand(install, "install", source)) {
+        ctx.addIssue({ code: "custom", path: ["releaseActions", "install"], message: `managed rollout install must run bb plugin install ${source}` });
+      }
+      if (!update || !isBbPluginCommand(update, "update", pluginId)) {
+        ctx.addIssue({ code: "custom", path: ["releaseActions", "update"], message: `managed rollout update must run bb plugin update ${pluginId}` });
+      }
+      if (!reload || !isBbPluginCommand(reload, "reload", pluginId)) {
+        ctx.addIssue({ code: "custom", path: ["releaseActions", "reload"], message: `managed rollout reload must run bb plugin reload ${pluginId}` });
+      }
     }
   });
 
@@ -235,6 +284,7 @@ export interface OfficialHarnessSourceInspection {
   surface: ReleaseGateSurface;
   sourcePaths: string[];
   verifiedSourcePaths: string[];
+  targetedSourcePaths: string[];
   verified: boolean;
   issues: string[];
 }
@@ -256,6 +306,7 @@ export async function inspectOfficialHarnessSources(
   const sourcePaths = [...(policy.harnessSources[surface] ?? [])];
   const moduleSpecifier = surface === "backend" ? "@bb/plugin-sdk/testing" : "@bb/plugin-sdk/testing/app";
   const verifiedSourcePaths: string[] = [];
+  const targetedSourcePaths: string[] = [];
   const issues: string[] = [];
   if (sourcePaths.length === 0) issues.push(`No ${surface} harnessSources are configured`);
   for (const sourcePath of sourcePaths) {
@@ -273,5 +324,13 @@ export async function inspectOfficialHarnessSources(
       issues.push(error instanceof Error ? error.message : String(error));
     }
   }
-  return { surface, sourcePaths, verifiedSourcePaths, verified: verifiedSourcePaths.length > 0, issues };
+  const command = policy.harness[surface];
+  if (command) {
+    const args = new Set(command.args.map(normalizedPolicyPath));
+    targetedSourcePaths.push(...verifiedSourcePaths.filter((sourcePath) => args.has(normalizedPolicyPath(sourcePath))));
+  }
+  if (verifiedSourcePaths.length > 0 && targetedSourcePaths.length === 0) {
+    issues.push(`${surface} harness command does not target a verified official SDK test source`);
+  }
+  return { surface, sourcePaths, verifiedSourcePaths, targetedSourcePaths, verified: targetedSourcePaths.length > 0, issues };
 }

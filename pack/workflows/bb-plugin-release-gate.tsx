@@ -85,6 +85,7 @@ const harnessSchema = z.object({
   surface: z.enum(["backend", "frontend"]),
   sourcePaths: z.array(z.string()),
   verifiedSourcePaths: z.array(z.string()),
+  targetedSourcePaths: z.array(z.string()),
   ran: z.boolean(),
   ok: z.boolean(),
   exitCode: z.number().int(),
@@ -152,7 +153,7 @@ const approvalSchema = z.object({
 const bindingGuardSchema = z.object({ summary: z.string(), ok: z.boolean(), boundHash: z.string() });
 const releaseActionSchema = z.object({
   summary: z.string(),
-  action: z.enum(["commit", "push", "publish", "install", "reload"]),
+  action: z.enum(["commit", "push", "publish", "install", "update", "reload"]),
   ok: z.boolean(),
   exitCode: z.number().int(),
   outputTail: z.string(),
@@ -161,7 +162,8 @@ const releasePlanSchema = z.object({
   summary: z.string(),
   pluginId: z.string(),
   intendedRevision: z.string().regex(/^[a-f0-9]{40}$/),
-  actions: z.array(z.enum(["commit", "push", "publish", "install", "reload"])),
+  rolloutMode: z.enum(["legacy", "absent", "updatable", "current"]),
+  actions: z.array(z.enum(["commit", "push", "publish", "install", "update", "reload"])),
 });
 const rolloutVerificationSchema = z.object({
   summary: z.string(),
@@ -226,8 +228,10 @@ type CommandEvidence = z.infer<typeof commandEvidenceSchema>;
 type HarnessEvidence = z.infer<typeof harnessSchema>;
 type LiveEvidence = z.infer<typeof liveCheckSchema>;
 type ReleaseAction = keyof ReleaseGatePolicy["releaseActions"];
-const RELEASE_ACTIONS: readonly ReleaseAction[] = ["commit", "push", "publish", "install", "reload"];
+type RolloutMode = z.infer<typeof releasePlanSchema>["rolloutMode"];
+const RELEASE_ACTIONS: readonly ReleaseAction[] = ["commit", "push", "publish", "install", "update", "reload"];
 const REQUIRED_ROLLOUT_ACTIONS: readonly ReleaseAction[] = ["install", "reload"];
+const REQUIRED_MANAGED_ROLLOUT_ACTIONS: readonly ReleaseAction[] = ["install", "update", "reload"];
 
 function parseJson<T>(value: string): T {
   return JSON.parse(value) as T;
@@ -517,6 +521,35 @@ export function parseInstalledRevision(output: string): string | null {
   }
 }
 
+export function classifyManagedRollout(
+  evidence: Pick<CommandEvidence, "ok" | "outputTail">,
+  intendedSource: string,
+  intendedRevision: string,
+): { mode: Exclude<RolloutMode, "legacy">; installedRevision: string | null } {
+  if (!evidence.ok) {
+    if (/HTTP 404:\s*unknown plugin\b/iu.test(evidence.outputTail)) return { mode: "absent", installedRevision: null };
+    throw new Error(`Cannot inspect installed plugin: ${evidence.outputTail}`);
+  }
+  try {
+    const start = evidence.outputTail.indexOf("{");
+    const end = evidence.outputTail.lastIndexOf("}");
+    const parsed = JSON.parse(evidence.outputTail.slice(start, end + 1)) as {
+      requested?: unknown;
+      history?: Array<{ version?: unknown }>;
+    };
+    if (parsed.requested !== intendedSource) {
+      throw new Error(`installed source ${String(parsed.requested ?? "unknown")} does not match ${intendedSource}`);
+    }
+    const installedRevision = parsed.history?.[0]?.version;
+    if (typeof installedRevision !== "string" || !/^[a-f0-9]{40}$/u.test(installedRevision)) {
+      throw new Error("installed source has no active 40-character revision");
+    }
+    return { mode: installedRevision === intendedRevision ? "current" : "updatable", installedRevision };
+  } catch (error) {
+    throw new Error(`Cannot classify installed plugin: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 function requireBinding<T>(value: T | undefined): T {
   return value as T;
 }
@@ -538,6 +571,7 @@ export default smithers((ctx) => {
   const report = ctx.outputMaybe(outputs.report, { nodeId: "report" });
   const gateAssertion = ctx.outputMaybe(outputs.releaseGuard, { nodeId: "gate-assertion" });
   const acceptance = ctx.outputMaybe(outputs.acceptanceVerdict, { nodeId: "acceptance-verdict" });
+  const acceptanceAssertion = ctx.outputMaybe(outputs.releaseGuard, { nodeId: "acceptance-assertion" });
   const releaseApproval = ctx.outputMaybe(outputs.releaseApproval, { nodeId: "release-approval" });
   const releaseGuard = ctx.outputMaybe(outputs.releaseGuard, { nodeId: "release-guard" });
   const releasePlan = ctx.outputMaybe(outputs.releasePlan, { nodeId: "release-plan" });
@@ -562,12 +596,13 @@ export default smithers((ctx) => {
   const liveReady = policy !== undefined && policy.liveChecks.every((check) => liveResults.has(check.id));
 
   const configuredActions = policy ? RELEASE_ACTIONS.filter((action) => policy.releaseActions[action] !== undefined) : [];
+  const selectedActions = releasePlan?.actions ?? [];
   const releaseResults = new Map<ReleaseAction, z.infer<typeof releaseActionSchema>>();
   for (const action of RELEASE_ACTIONS) {
     const row = ctx.outputMaybe(outputs.releaseAction, { nodeId: `release-${action}` });
     if (row) releaseResults.set(action, row);
   }
-  const releaseActionsReady = configuredActions.every((action) => releaseResults.has(action));
+  const releaseActionsReady = selectedActions.every((action) => releaseResults.has(action));
   const releaseAuthorized = policy?.requireReleaseApproval === false || releaseApproval?.approved === true;
 
   const renderHarnessBranch = (surface: ReleaseGateSurface) => {
@@ -589,6 +624,7 @@ export default smithers((ctx) => {
                   surface,
                   sourcePaths: sourceInspection.sourcePaths,
                   verifiedSourcePaths: sourceInspection.verifiedSourcePaths,
+                  targetedSourcePaths: sourceInspection.targetedSourcePaths,
                   ran: false,
                   ok: false,
                   exitCode: -1,
@@ -601,6 +637,7 @@ export default smithers((ctx) => {
                 surface,
                 sourcePaths: sourceInspection.sourcePaths,
                 verifiedSourcePaths: sourceInspection.verifiedSourcePaths,
+                targetedSourcePaths: sourceInspection.targetedSourcePaths,
                 ran: true,
                 summary: evidence.ok ? `${surface} harness passed` : `${surface} harness failed`,
               };
@@ -780,7 +817,8 @@ export default smithers((ctx) => {
                 <Task id="release-plan" output={outputs.releasePlan} dependsOn={["gate-assertion"]} retries={0}>
                   {async () => {
                     if (!policy.rollout) throw new Error("Release mode requires rollout.pluginId");
-                    const missing = REQUIRED_ROLLOUT_ACTIONS.filter((action) => policy.releaseActions[action] === undefined);
+                    const requiredActions = policy.rollout.source ? REQUIRED_MANAGED_ROLLOUT_ACTIONS : REQUIRED_ROLLOUT_ACTIONS;
+                    const missing = requiredActions.filter((action) => policy.releaseActions[action] === undefined);
                     if (missing.length > 0) throw new Error(`Release mode requires configured rollout actions: ${missing.join(", ")}`);
                     const revision = await runCommand(
                       { executable: "git", args: ["rev-parse", "HEAD"], timeoutMs: 30_000 },
@@ -790,7 +828,28 @@ export default smithers((ctx) => {
                     );
                     const intendedRevision = revision.outputTail.trim();
                     if (!revision.ok || !/^[a-f0-9]{40}$/u.test(intendedRevision)) throw new Error(`Cannot resolve intended release revision: ${revision.outputTail}`);
-                    return { summary: `Roll out ${policy.rollout.pluginId} at ${intendedRevision}`, pluginId: policy.rollout.pluginId, intendedRevision, actions: configuredActions };
+                    let rolloutMode: RolloutMode = "legacy";
+                    let actions = configuredActions;
+                    if (policy.rollout.source) {
+                      const sourceEvidence = await runCommand(
+                        { executable: "bb", args: ["plugin", "source", policy.rollout.pluginId, "--json"], timeoutMs: 60_000 },
+                        packageManager ?? "npm",
+                        pluginRoot,
+                        "release-source",
+                      );
+                      const classified = classifyManagedRollout(sourceEvidence, policy.rollout.source, intendedRevision);
+                      rolloutMode = classified.mode;
+                      const preparation = configuredActions.filter((action) => !["install", "update", "reload"].includes(action));
+                      const mutation = rolloutMode === "absent" ? ["install" as const] : rolloutMode === "updatable" ? ["update" as const] : [];
+                      actions = [...preparation, ...mutation, "reload"];
+                    }
+                    return {
+                      summary: `Roll out ${policy.rollout.pluginId} at ${intendedRevision} (${rolloutMode})`,
+                      pluginId: policy.rollout.pluginId,
+                      intendedRevision,
+                      rolloutMode,
+                      actions,
+                    };
                   }}
                 </Task>
               ) : null}
@@ -858,27 +917,38 @@ export default smithers((ctx) => {
                 </Task>
               ) : null}
 
-              {acceptance?.ok && policy?.requireReleaseApproval ? (
+              {acceptance ? (
+                <Task id="acceptance-assertion" output={outputs.releaseGuard} dependsOn={["acceptance-verdict"]} retries={0}>
+                  {() => {
+                    if (!acceptance.ok) {
+                      throw new Error(`Live acceptance failed: ${acceptance.failures.map((failure) => `${failure.scope}: ${failure.message}`).join("; ")}`);
+                    }
+                    return { summary: "Live acceptance permits release", ok: true, boundHash: acceptance.evidenceHash };
+                  }}
+                </Task>
+              ) : null}
+
+              {acceptance && acceptanceAssertion?.ok && policy?.requireReleaseApproval ? (
                 <Approval
                   id="release-approval"
                   output={outputs.releaseApproval}
-                  dependsOn={["acceptance-verdict"]}
+                  dependsOn={["acceptance-assertion"]}
                   bind={requireBinding(ctx.prove(outputs.acceptanceVerdict, { nodeId: "acceptance-verdict" }))}
                   request={{
                     title: "Execute configured BB plugin release actions?",
-                    summary: `${report?.markdownReport ?? ""}\n\nAcceptance SHA-256: ${acceptance.evidenceHash}\nActions: ${configuredActions.join(", ") || "none"}`,
-                    metadata: { evidenceHash: acceptance.evidenceHash, actions: configuredActions },
+                    summary: `${report?.markdownReport ?? ""}\n\nAcceptance SHA-256: ${acceptance.evidenceHash}\nActions: ${selectedActions.join(", ") || "none"}`,
+                    metadata: { evidenceHash: acceptance.evidenceHash, actions: selectedActions },
                   }}
                   onDeny="fail"
                 />
               ) : null}
 
-              {acceptance?.ok && releaseAuthorized ? (
+              {acceptance && acceptanceAssertion?.ok && releaseAuthorized ? (
                 <Sequence>
                   <Task
                     id="release-guard"
                     output={outputs.releaseGuard}
-                    dependsOn={[policy?.requireReleaseApproval ? "release-approval" : "acceptance-verdict"]}
+                    dependsOn={[policy?.requireReleaseApproval ? "release-approval" : "acceptance-assertion"]}
                     bind={[
                       requireBinding(ctx.prove(outputs.acceptanceVerdict, { nodeId: "acceptance-verdict" })),
                       ...(policy?.requireReleaseApproval
@@ -895,9 +965,9 @@ export default smithers((ctx) => {
                   </Task>
 
                   {releaseGuard
-                    ? configuredActions.map((action, index) => {
+                    ? selectedActions.map((action, index) => {
                         const command = policy?.releaseActions[action];
-                        const previous = configuredActions[index - 1];
+                        const previous = selectedActions[index - 1];
                         return command && packageManager ? (
                           <Task
                             key={action}
@@ -920,7 +990,7 @@ export default smithers((ctx) => {
                     <Task
                       id="rollout-verification"
                       output={outputs.rolloutVerification}
-                      dependsOn={[configuredActions.length > 0 ? `release-${configuredActions.at(-1)}` : "release-guard"]}
+                      dependsOn={[selectedActions.length > 0 ? `release-${selectedActions.at(-1)}` : "release-guard"]}
                       retries={0}
                     >
                       {async () => {
@@ -959,7 +1029,7 @@ export default smithers((ctx) => {
                   {rolloutVerification?.ok ? (
                     <Task id="release-report" output={outputs.releaseReport} dependsOn={["rollout-assertion"]} retries={0}>
                       {() => ({
-                        summary: `Release completed with ${configuredActions.length} configured actions; ${rolloutVerification.summary}`,
+                        summary: `Release completed via ${releasePlan?.rolloutMode ?? "legacy"} with ${selectedActions.length} actions; ${rolloutVerification.summary}`,
                         verdict: verdict?.verdict === "waived" ? "waived" : "pass",
                         artifact: `smithers://outputs/${ctx.runId}/release-report`,
                       })}

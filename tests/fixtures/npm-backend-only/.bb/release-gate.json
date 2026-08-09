@@ -5,7 +5,7 @@
     { "id": "check", "executable": "$packageManager", "args": ["run", "check"] }
   ],
   "harness": {
-    "backend": { "executable": "$packageManager", "args": ["run", "harness:backend"] }
+    "backend": { "executable": "$packageManager", "args": ["run", "harness:backend", "--", "server.test.ts"] }
   },
   "harnessSources": {
     "backend": ["server.test.ts"]

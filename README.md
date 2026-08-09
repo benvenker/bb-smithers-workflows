@@ -42,17 +42,23 @@ Each consumer owns `.bb/release-gate.json`. Commands are executable/argv records
   "build": { "executable": "$packageManager", "args": ["run", "build"] },
   "artifacts": [{ "path": "dist/server.js", "required": true, "minBytes": 1 }],
   "requireReleaseApproval": true,
+  "rollout": {
+    "pluginId": "example",
+    "source": "git:https://github.com/example/plugin.git@main"
+  },
   "releaseActions": {
+    "install": { "executable": "bb", "args": ["plugin", "install", "git:https://github.com/example/plugin.git@main", "--yes", "--json"] },
+    "update": { "executable": "bb", "args": ["plugin", "update", "example", "--yes", "--json"] },
     "reload": { "executable": "bb", "args": ["plugin", "reload", "example"] }
   }
 }
 ```
 
-Verify commands reject shell wrappers, Git/GitHub commands, package installation or publishing, and live BB plugin mutations. A declared backend or frontend surface must have a command and source file importing the corresponding official `@bb/plugin-sdk/testing` module.
+Verify commands reject shell wrappers, Git/GitHub commands, package installation or publishing, and live BB plugin mutations. A declared backend or frontend surface must have a command that targets a declared source file importing the corresponding official `@bb/plugin-sdk/testing` module. A failed or untargeted harness blocks before release actions.
 
 Mutating `liveChecks` must declare a rollback; `verifyRollback` is optional. `releaseActions` run only in explicit release mode after verification and live acceptance pass. Set `requireReleaseApproval` to `false` only when the consumer intentionally does not need the one final Smithers approval.
 
-Release mode also requires `rollout.pluginId` plus `install` and `reload` actions. It captures the consumer's `HEAD`, runs the configured rollout, then refuses success unless `bb plugin source <id> --json` reports that exact revision as active.
+Managed release mode uses `rollout.pluginId` and `rollout.source` plus `install`, `update`, and `reload` actions. It installs an absent plugin, updates the intended managed source when its SHA is older, skips the mutation when already current, always reloads, and refuses incompatible or indeterminate registrations. Success still requires `bb plugin source <id> --json` to report the consumer's exact captured `HEAD` revision.
 
 Consumers temporarily using `file:vendor/*.tgz` for `@bb/plugin-sdk` are checked against `engines.bbPluginSdk` on every gate run. The gate fails with migration instructions as soon as a compatible official package exists; registry outages are reported as indeterminate.
 

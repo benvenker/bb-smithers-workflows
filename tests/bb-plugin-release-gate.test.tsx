@@ -8,6 +8,7 @@ import { discoverWorkflows, resolveWorkflow } from "@smthrs/cli/workflows";
 import type { TaskDescriptor } from "smthrs";
 import { renderWorkflow } from "smthrs/testing";
 import workflow, {
+  classifyManagedRollout,
   inspectSdkFallback,
   parseInstalledRevision,
   releaseGatePolicySchema,
@@ -57,6 +58,7 @@ function stageOutputs(name: string): OutputSnapshot {
       surface,
       sourcePaths: [`${surface}.test.ts`],
       verifiedSourcePaths: [`${surface}.test.ts`],
+      targetedSourcePaths: [`${surface}.test.ts`],
       ran: true,
       ok: true,
       exitCode: 0,
@@ -152,6 +154,7 @@ function releaseOutputs(name: string, requireApproval = true): OutputSnapshot {
       : {}),
     releaseGuard: [
       row("gate-assertion", { summary: "permitted", ok: true, boundHash: "a".repeat(64) }),
+      row("acceptance-assertion", { summary: "accepted", ok: true, boundHash: "b".repeat(64) }),
       row("release-guard", { summary: "current", ok: true, boundHash: "b".repeat(64) }),
     ],
     releasePlan: [
@@ -159,6 +162,7 @@ function releaseOutputs(name: string, requireApproval = true): OutputSnapshot {
         summary: "roll out fixture",
         pluginId: "fixture-plugin",
         intendedRevision: "d".repeat(40),
+        rolloutMode: "legacy",
         actions: ["commit", "push", "publish", "install", "reload"],
       }),
     ],
@@ -180,6 +184,36 @@ function releaseOutputs(name: string, requireApproval = true): OutputSnapshot {
       row("release-report", { summary: "release passed", verdict: "pass", artifact: "smithers://outputs/test/release-report" }),
     ],
   };
+}
+
+function managedReleaseOutputs(mode: "absent" | "updatable" | "current"): OutputSnapshot {
+  const snapshot = releaseOutputs("npm-backend-only", false);
+  const loadRow = snapshot.loadPolicy[0] as Record<string, unknown>;
+  const policy = JSON.parse(String(loadRow.policyJson)) as Record<string, unknown>;
+  const source = "git:https://github.com/example/fixture-plugin.git@main";
+  loadRow.policyJson = JSON.stringify({
+    ...policy,
+    rollout: { pluginId: "fixture-plugin", source },
+    releaseActions: {
+      install: { executable: "bb", args: ["plugin", "install", source, "--yes", "--json"] },
+      update: { executable: "bb", args: ["plugin", "update", "fixture-plugin", "--yes", "--json"] },
+      reload: { executable: "bb", args: ["plugin", "reload", "fixture-plugin", "--json"] },
+    },
+  });
+  const actions = [...(mode === "absent" ? ["install"] : mode === "updatable" ? ["update"] : []), "reload"];
+  snapshot.releasePlan = [
+    row("release-plan", {
+      summary: `roll out fixture (${mode})`,
+      pluginId: "fixture-plugin",
+      intendedRevision: "d".repeat(40),
+      rolloutMode: mode,
+      actions,
+    }),
+  ];
+  snapshot.releaseAction = actions.map((action) =>
+    row(`release-${action}`, { summary: `${action} passed`, action, ok: true, exitCode: 0, outputTail: "ok" }),
+  );
+  return snapshot;
 }
 
 function taskMap(graph: { tasks: readonly TaskDescriptor[] }) {
@@ -205,6 +239,16 @@ async function runInstalledGate(name: string, mode: "verify" | "release", mutate
       const policy = JSON.parse(readFileSync(policyPath, "utf8")) as Record<string, unknown>;
       mutatePolicy(policy);
       writeFileSync(policyPath, `${JSON.stringify(policy, null, 2)}\n`);
+    }
+    if (mode === "release") {
+      for (const command of [
+        ["git", "init", "-q"],
+        ["git", "add", "."],
+        ["git", "-c", "user.name=Smithers Test", "-c", "user.email=smithers-test@example.invalid", "commit", "-qm", "fixture"],
+      ]) {
+        const result = Bun.spawnSync(command, { cwd: pluginRoot, stdout: "pipe", stderr: "pipe" });
+        if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
+      }
     }
     mkdirSync(join(pluginRoot, ".smithers"), { recursive: true });
     await addPack(`file:${packRoot}`, { from: pluginRoot, yes: true });
@@ -252,6 +296,12 @@ describe("bb-plugin-release-gate policy", () => {
       }).success,
     ).toBe(false);
     expect(releaseGatePolicySchema.safeParse({ ...policy, harnessSources: { backend: [], frontend: [] } }).success).toBe(false);
+    expect(
+      releaseGatePolicySchema.safeParse({
+        ...policy,
+        harness: { backend: { executable: "npm", args: ["test", "--", "some-other.test.ts"] } },
+      }).success,
+    ).toBe(false);
   });
 
   test("official harness evidence requires exact SDK testing imports", async () => {
@@ -261,17 +311,51 @@ describe("bb-plugin-release-gate policy", () => {
     expect(await inspectOfficialHarnessSources(backend.root, backend.policy, "backend")).toMatchObject({
       verified: true,
       verifiedSourcePaths: ["server.test.ts"],
+      targetedSourcePaths: ["server.test.ts"],
       issues: [],
     });
     expect(await inspectOfficialHarnessSources(frontend.root, frontend.policy, "frontend")).toMatchObject({
       verified: true,
       verifiedSourcePaths: ["app.test.tsx"],
+      targetedSourcePaths: ["app.test.tsx"],
       issues: [],
     });
     expect(await inspectOfficialHarnessSources(missing.root, missing.policy, "backend")).toMatchObject({
       verified: false,
       verifiedSourcePaths: [],
+      targetedSourcePaths: [],
     });
+  });
+
+  test("managed rollout classification is fail-closed", () => {
+    const source = "git:https://github.com/example/plugin.git@main";
+    const intended = "a".repeat(40);
+    expect(classifyManagedRollout({ ok: false, outputTail: "Error: HTTP 404: unknown plugin" }, source, intended)).toEqual({
+      mode: "absent",
+      installedRevision: null,
+    });
+    expect(
+      classifyManagedRollout(
+        { ok: true, outputTail: JSON.stringify({ requested: source, history: [{ version: "b".repeat(40) }] }) },
+        source,
+        intended,
+      ),
+    ).toEqual({ mode: "updatable", installedRevision: "b".repeat(40) });
+    expect(
+      classifyManagedRollout(
+        { ok: true, outputTail: JSON.stringify({ requested: source, history: [{ version: intended }] }) },
+        source,
+        intended,
+      ),
+    ).toEqual({ mode: "current", installedRevision: intended });
+    expect(() => classifyManagedRollout({ ok: false, outputTail: "connection refused" }, source, intended)).toThrow("Cannot inspect installed plugin");
+    expect(() =>
+      classifyManagedRollout(
+        { ok: true, outputTail: JSON.stringify({ requested: "path:/tmp/plugin", history: [{ version: intended }] }) },
+        source,
+        intended,
+      ),
+    ).toThrow("does not match");
   });
 
   test("vendored SDK fallback expires when a compatible official package appears", async () => {
@@ -364,6 +448,7 @@ describe("bb-plugin-release-gate graph", () => {
       expect.arrayContaining([
         "live-mutating-smoke",
         "acceptance-verdict",
+        "acceptance-assertion",
         "release-approval",
         "release-guard",
         "release-plan",
@@ -382,7 +467,8 @@ describe("bb-plugin-release-gate graph", () => {
     expect(approvals[0]?.proofBindingRequired).toBe(true);
     expect(tasks.get("release-plan")?.dependsOn).toContain("gate-assertion");
     expect(tasks.get("live-mutating-smoke")?.dependsOn).toContain("release-plan");
-    expect(tasks.get("release-approval")?.dependsOn).toContain("acceptance-verdict");
+    expect(tasks.get("acceptance-assertion")?.dependsOn).toContain("acceptance-verdict");
+    expect(tasks.get("release-approval")?.dependsOn).toContain("acceptance-assertion");
     expect(tasks.get("release-guard")?.dependsOn).toContain("release-approval");
     expect(tasks.get("release-push")?.dependsOn).toContain("release-commit");
     expect(tasks.get("rollout-verification")?.dependsOn).toContain("release-reload");
@@ -394,8 +480,21 @@ describe("bb-plugin-release-gate graph", () => {
     const tasks = taskMap(graph);
     expect(graph.tasks.filter((task) => task.needsApproval)).toEqual([]);
     expect(tasks.has("release-approval")).toBe(false);
-    expect(tasks.get("release-guard")?.dependsOn).toContain("acceptance-verdict");
+    expect(tasks.get("release-guard")?.dependsOn).toContain("acceptance-assertion");
     expect(tasks.get("release-commit")?.dependsOn).toContain("release-guard");
+  });
+
+  test("managed rollout renders exactly install, update, or reload-only before verification", async () => {
+    const absent = taskMap(await render("npm-backend-only", "release", managedReleaseOutputs("absent")));
+    const updatable = taskMap(await render("npm-backend-only", "release", managedReleaseOutputs("updatable")));
+    const current = taskMap(await render("npm-backend-only", "release", managedReleaseOutputs("current")));
+    expect([absent.has("release-install"), absent.has("release-update"), absent.has("release-reload")]).toEqual([true, false, true]);
+    expect([updatable.has("release-install"), updatable.has("release-update"), updatable.has("release-reload")]).toEqual([false, true, true]);
+    expect([current.has("release-install"), current.has("release-update"), current.has("release-reload")]).toEqual([false, false, true]);
+    expect(absent.get("release-reload")?.dependsOn).toContain("release-install");
+    expect(updatable.get("release-reload")?.dependsOn).toContain("release-update");
+    expect(current.get("release-reload")?.dependsOn).toContain("release-guard");
+    expect(current.get("rollout-verification")?.dependsOn).toContain("release-reload");
   });
 
   test("a failed verify verdict prevents every release-mode side effect", async () => {
@@ -413,6 +512,26 @@ describe("bb-plugin-release-gate graph", () => {
     outputs.releaseGuard = [];
     const graph = await render("npm-backend-only", "release", outputs);
     expect([...taskMap(graph).keys()].filter((id) => /^(live-|release-)/.test(id))).toEqual([]);
+  });
+
+  test("failed live acceptance renders a throwing assertion and no release action", async () => {
+    const outputs = releaseOutputs("npm-backend-only", false);
+    outputs.acceptanceVerdict = [
+      row("acceptance-verdict", {
+        summary: "failed",
+        ok: false,
+        failures: [{ scope: "live:mutating-smoke", message: "live check failed" }],
+        evidenceHash: "b".repeat(64),
+        artifact: "smithers://outputs/test/acceptance-verdict",
+      }),
+    ];
+    outputs.releaseGuard = [row("gate-assertion", { summary: "permitted", ok: true, boundHash: "a".repeat(64) })];
+    const tasks = taskMap(await render("npm-backend-only", "release", outputs));
+    expect(tasks.has("acceptance-assertion")).toBe(true);
+    expect(tasks.has("release-guard")).toBe(false);
+    expect(tasks.has("release-install")).toBe(false);
+    expect(tasks.has("release-reload")).toBe(false);
+    expect(tasks.has("release-report")).toBe(false);
   });
 });
 
@@ -445,6 +564,33 @@ describe("native pack installation", () => {
     });
     expect(failed.exitCode).not.toBe(0);
     expect(failed.output).toContain("Release gate failed");
+  }, 60_000);
+
+  test("a planted official SDK harness failure exits nonzero", async () => {
+    const failed = await runInstalledGate("npm-backend-only", "verify", (policy) => {
+      policy.harness = {
+        backend: { executable: "node", args: ["-e", "process.exit(7)", "server.test.ts"] },
+      };
+    });
+    expect(failed.exitCode).not.toBe(0);
+    expect(failed.output).toContain("harness:backend");
+    expect(failed.output).toContain("Release gate failed");
+  }, 60_000);
+
+  test("failed live acceptance exits nonzero before release actions", async () => {
+    const failed = await runInstalledGate("npm-backend-only", "release", (policy) => {
+      policy.requireReleaseApproval = false;
+      policy.liveChecks = [
+        {
+          id: "planted-live-failure",
+          command: { executable: "node", args: ["-e", "process.exit(8)"] },
+          mutating: false,
+        },
+      ];
+    });
+    expect(failed.exitCode).not.toBe(0);
+    expect(failed.output).toContain("Live acceptance failed");
+    expect(failed.output).not.toContain("release-report");
   }, 60_000);
 
   test("release mode exits nonzero when real rollout configuration is absent", async () => {
